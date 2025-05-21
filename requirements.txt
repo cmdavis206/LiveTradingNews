@@ -1,4 +1,10 @@
 streamlit
 feedparser
 requests
+yfinance
+plotly
+streamlit-autorefresh
+youtube-transcript-api
+openai
+google-api-python-client
 
