@@ -57,9 +57,7 @@ except KeyError as e:
 # --- Initialize Firebase Firestore ---
 try:
     if not firebase_admin._apps:
-        # Load Firebase credentials from Streamlit secrets
-        firebase_creds = json.loads(st.secrets["firebase"]["credentials"])
-        cred = credentials.Certificate(firebase_creds)
+        cred = credentials.Certificate(dict(st.secrets["firebase"]))
         firebase_admin.initialize_app(cred)
     db = firestore.client()
 except Exception as e:
@@ -796,3 +794,4 @@ with tab_settings:
             st.rerun()
 
     st.markdown("---")
+    
