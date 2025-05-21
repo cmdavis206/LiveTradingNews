@@ -57,23 +57,11 @@ except KeyError as e:
 # --- Initialize Firebase Firestore ---
 try:
     if not firebase_admin._apps:
-        # Construct credentials dictionary from individual fields
-        firebase_creds = {
-            "type": st.secrets["firebase"]["type"],
-            "project_id": st.secrets["firebase"]["project_id"],
-            "private_key_id": st.secrets["firebase"]["private_key_id"],
-            "private_key": st.secrets["firebase"]["private_key"],
-            "client_email": st.secrets["firebase"]["client_email"],
-            "client_id": st.secrets["firebase"]["client_id"],
-            "auth_uri": st.secrets["firebase"]["auth_uri"],
-            "token_uri": st.secrets["firebase"]["token_uri"],
-            "auth_provider_x509_cert_url": st.secrets["firebase"]["auth_provider_x509_cert_url"],
-            "client_x509_cert_url": st.secrets["firebase"]["client_x509_cert_url"]
-        }
+        # Load Firebase credentials from Streamlit secrets
+        firebase_creds = json.loads(st.secrets["firebase"]["credentials"])
         cred = credentials.Certificate(firebase_creds)
         firebase_admin.initialize_app(cred)
     db = firestore.client()
-    db._client._timeout = 30  # Set timeout to 30 seconds
 except Exception as e:
     st.error(f"Failed to initialize Firestore: {e}")
     st.stop()
