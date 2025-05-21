@@ -7,4 +7,5 @@ streamlit-autorefresh
 youtube-transcript-api
 openai
 google-api-python-client
+firebase-admin
 
