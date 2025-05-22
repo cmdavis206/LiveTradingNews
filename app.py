@@ -15,6 +15,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import json
 import time
+import pytz
 
 # --- Streamlit page config ---
 st.set_page_config(page_title="Real Time Trader News", layout="wide")
@@ -46,6 +47,13 @@ def summarize_transcript(text, api_key):
         return response.choices[0].message.content.strip()
     except Exception as e:
         raise Exception(f"Could not summarize with OpenAI: {e}")
+
+def to_pdt(dt):
+    """Convert UTC datetime to PDT."""
+    if dt is None:
+        return None
+    pdt_tz = pytz.timezone("America/Los_Angeles")
+    return dt.astimezone(pdt_tz)
 
 # --- API Keys ---
 try:
@@ -258,46 +266,48 @@ with tab_dashboard:
         if 'last_news_fetch' not in st.session_state:
             st.session_state.last_news_fetch = None
 
-        # Force news fetch if 30 seconds have elapsed
+        # Fetch only new articles
         now = datetime.now(timezone.utc)
-        if (st.session_state.last_news_fetch is None or 
-            (now - st.session_state.last_news_fetch).total_seconds() >= 30):
-            st.session_state.news_items = []
-            st.session_state.last_news_fetch = now
-
-        # Fetch news if cache is empty
-        if not st.session_state.news_items:
-            all_news = []
-            for feed_url in rss_feeds:
-                try:
-                    feed = feedparser.parse(feed_url)
-                    if feed.bozo:
-                        st.warning(f"Invalid RSS feed: {feed_url}")
-                        continue
-                    for entry in feed.entries[:10]:  # Limit to 10 per feed
-                        try:
-                            pub_dt = (
-                                datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-                                if hasattr(entry, "published_parsed") and entry.published_parsed
-                                else datetime.now(timezone.utc)
-                            )
-                        except Exception:
-                            pub_dt = datetime.now(timezone.utc)
-                        all_news.append({
-                            "title": entry.title,
-                            "link": entry.link,
-                            "published": pub_dt,
-                            "source": feed_url
-                        })
-                except Exception as e:
-                    st.error(f"Error parsing RSS feed {feed_url}: {e}")
+        last_fetch = st.session_state.last_news_fetch
+        new_articles = []
+        for feed_url in rss_feeds:
+            try:
+                feed = feedparser.parse(feed_url)
+                if feed.bozo:
+                    st.warning(f"Invalid RSS feed: {feed_url}")
                     continue
+                for entry in feed.entries[:10]:  # Limit to 10 per feed
+                    try:
+                        pub_dt = (
+                            datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                            if hasattr(entry, "published_parsed") and entry.published_parsed
+                            else now
+                        )
+                        # Fetch only articles newer than last fetch
+                        if last_fetch is None or pub_dt > last_fetch:
+                            new_articles.append({
+                                "title": entry.title,
+                                "link": entry.link,
+                                "published": pub_dt,
+                                "source": feed_url
+                            })
+                    except Exception:
+                        continue
+            except Exception as e:
+                st.error(f"Error parsing RSS feed {feed_url}: {e}")
+                continue
 
-            # Deduplicate and sort news
-            unique_news = { (item["title"], item["link"]): item for item in all_news }.values()
-            sorted_news = sorted(unique_news, key=lambda x: x["published"], reverse=True)
-            st.session_state.news_items = sorted_news[:100]  # Limit to 100 headlines
-            st.write(f"Fetched {len(st.session_state.news_items)} headlines at {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        # Update news_items if new articles found
+        if new_articles:
+            # Append new articles
+            st.session_state.news_items.extend(new_articles)
+            # Deduplicate by title and link
+            unique_news = { (item["title"], item["link"]): item for item in st.session_state.news_items }.values()
+            # Sort by published date (newest first) and limit to 100
+            st.session_state.news_items = sorted(unique_news, key=lambda x: x["published"], reverse=True)[:100]
+            st.write(f"Fetched {len(new_articles)} new headlines at {to_pdt(now).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+        st.session_state.last_news_fetch = now
 
         # Pagination settings
         items_per_page = 10
@@ -325,7 +335,7 @@ with tab_dashboard:
             for item in page_items:
                 title = item["title"]
                 link = item["link"]
-                published = item["published"].strftime("%Y-%m-%d %H:%M:%S")
+                published = to_pdt(item["published"]).strftime("%Y-%m-%d %H:%M:%S %Z")
                 source = item["source"]
                 flagged = contains_flagged_word(title, keywords) or contains_flagged_word(title, tickers)
                 prefix = ":red_circle: **" if flagged else ""
@@ -505,9 +515,10 @@ with tab_video_summary:
     
     # Display last fetch time if videos exist
     if st.session_state.videos and st.session_state.last_fetch_time:
-        fetch_time_str = st.session_state.last_fetch_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        fetch_time_pdt = to_pdt(st.session_state.last_fetch_time)
+        fetch_time_str = fetch_time_pdt.strftime("%Y-%m-%d %H:%M:%S %Z")
         st.write(f"Last fetched: {fetch_time_str} ({time_ago(st.session_state.last_fetch_time)})")
-    
+
     if st.button("Fetch Recent Videos", key="fetch_recent_videos"):
         if not YOUTUBE_API_KEY or not OPENAI_API_KEY:
             st.error("API keys missing. Check your settings tab or Streamlit secrets.")
@@ -608,7 +619,8 @@ with tab_video_summary:
                 with col2:
                     st.subheader(video['title'])
                     st.write(f"Channel: {video['channel_name']}")
-                    st.write(f"Published: {video['published']}")
+                    published_dt = datetime.strptime(video['published'], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    st.write(f"Published: {to_pdt(published_dt).strftime('%Y-%m-%d %H:%M:%S %Z')}")
                     st.write(f"Source: {video['source']}")
                     st.markdown(f"[Watch on YouTube](https://www.youtube.com/watch?v={vid})")
 
@@ -625,7 +637,8 @@ with tab_video_summary:
                             existing_summary = check_existing_summary(vid)
                             if existing_summary:
                                 st.session_state.summaries[vid] = existing_summary['summary']  # Update cache
-                                st.info(f"Summarized by {existing_summary['summarized_by']} at {existing_summary['timestamp']}.")
+                                summary_dt = datetime.strptime(existing_summary['timestamp'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                                st.info(f"Summarized by {existing_summary['summarized_by']} at {to_pdt(summary_dt).strftime('%Y-%m-%d %H:%M:%S %Z')}.")
                             else:
                                 st.info("No existing summary found.")
 
@@ -681,7 +694,8 @@ with tab_video_summary:
                     if existing_summary:
                         st.session_state.custom_url_summary = existing_summary['summary']
                         st.session_state.custom_url_error = None
-                        st.info(f"This video has already been summarized by {existing_summary['summarized_by']} at {existing_summary['timestamp']}.")
+                        summary_dt = datetime.strptime(existing_summary['timestamp'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        st.info(f"This video has already been summarized by {existing_summary['summarized_by']} at {to_pdt(summary_dt).strftime('%Y-%m-%d %H:%M:%S %Z')}.")
                     else:
                         transcript_data = None
                         try:
