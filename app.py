@@ -120,19 +120,30 @@ def save_config(keywords, tickers, rss_feeds, sp500):
 
 # Load config with session state
 if 'config' not in st.session_state:
-    keywords, tickers, rss_feeds, sp500 = load_config()
-    st.session_state['config'] = {
-        'keywords': keywords,
-        'tickers': tickers,
-        'rss_feeds': rss_feeds,
-        'sp500': sp500
-    }
-else:
-    config = st.session_state['config']
-    keywords = config['keywords']
-    tickers = config['tickers']
-    rss_feeds = config['rss_feeds']
-    sp500 = config['sp500']
+    try:
+        keywords, tickers, rss_feeds, sp500 = load_config()
+        st.session_state['config'] = {
+            'keywords': keywords,
+            'tickers': tickers,
+            'rss_feeds': rss_feeds,
+            'sp500': sp500
+        }
+        st.write("Config loaded from Firestore.")
+    except Exception as e:
+        st.error(f"Error loading config: {e}")
+        # Fallback to defaults
+        st.session_state['config'] = {
+            'keywords': ["buy", "sell", "trade", "market", "stock"],
+            'tickers': ["AAPL", "MSFT", "NVDA", "SPY", "TSLA", "GOOG", "AMZN", "META", "NFLX", "AMD"],
+            'rss_feeds': ["https://finance.yahoo.com/news/rss", "https://www.cnbc.com/id/100003114/device/rss/rss.html"],
+            'sp500': ["AAPL", "MSFT", "GOOGL"]
+        }
+        st.write("Using default config.")
+config = st.session_state['config']
+keywords = config['keywords']
+tickers = config['tickers']
+rss_feeds = config['rss_feeds']
+sp500 = config['sp500']
 
 # Function to check if a video has already been summarized
 def check_existing_summary(video_id):
@@ -187,12 +198,12 @@ with tab_dashboard:
     st.caption("MVP – News Dashboard for Active Traders")
 
     # --- Auto-Refresh ---
-    st_autorefresh(interval=10000, limit=None, key="news_autorefresh")
+    st_autorefresh(interval=60000, limit=None, key="news_autorefresh")  # Refresh every 60 seconds
 
     # --- Top Movers ---
     st.subheader("Top Movers Today (S&P 500)")
     try:
-        df = yf.download(sp500, period="1d", interval="1d", group_by="ticker", progress=False, threads=False)
+        df = yf.download(sp500, period="1d", interval="1d", group_by="ticker", progress=False, threads=False, auto_adjust=False)
     except Exception:
         df = pd.DataFrame()
 
@@ -225,43 +236,100 @@ with tab_dashboard:
     # --- News Feed & Chart ---
     col1, col2 = st.columns([2, 3], gap="large")
     with col1:
+        # --- News Headlines with Pagination ---
         st.subheader("News Headlines")
-        all_news = []
-        for feed_url in rss_feeds:
-            try:
-                feed = feedparser.parse(feed_url)
-                if feed.bozo:
-                    continue
-                for entry in feed.entries[:10]:
-                    try:
-                        pub_dt = (
-                            datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-                            if hasattr(entry, "published_parsed") and entry.published_parsed
-                            else datetime.now(timezone.utc)
-                        )
-                    except Exception:
-                        pub_dt = datetime.now(timezone.utc)
-                    all_news.append({
-                        "title": entry.title,
-                        "link": entry.link,
-                        "published": pub_dt,
-                        "source": feed_url
-                    })
-            except Exception:
-                pass
 
-        unique_news = { (item["title"], item["link"]): item for item in all_news }.values()
-        sorted_news = sorted(unique_news, key=lambda x: x["published"], reverse=True)
+        # Initialize session state for news and pagination
+        if 'news_items' not in st.session_state:
+            st.session_state.news_items = []
+        if 'current_page' not in st.session_state:
+            st.session_state.current_page = 1
 
-        for item in sorted_news[:50]:
-            title = item["title"]
-            link = item["link"]
-            published = item["published"].strftime("%Y-%m-%d %H:%M:%S")
-            source = item["source"]
-            flagged = contains_flagged_word(title, keywords) or contains_flagged_word(title, tickers)
-            prefix = ":red_circle: **" if flagged else ""
-            suffix = "**" if flagged else ""
-            st.markdown(f"- {prefix}[{title}]({link}){suffix}  \n*{published}*  \n`{source}`")
+        # Fetch news only if not already cached
+        if not st.session_state.news_items:
+            all_news = []
+            for feed_url in rss_feeds:
+                try:
+                    feed = feedparser.parse(feed_url)
+                    if feed.bozo:
+                        continue
+                    for entry in feed.entries[:10]:  # Limit to 10 per feed
+                        try:
+                            pub_dt = (
+                                datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                                if hasattr(entry, "published_parsed") and entry.published_parsed
+                                else datetime.now(timezone.utc)
+                            )
+                        except Exception:
+                            pub_dt = datetime.now(timezone.utc)
+                        all_news.append({
+                            "title": entry.title,
+                            "link": entry.link,
+                            "published": pub_dt,
+                            "source": feed_url
+                        })
+                except Exception:
+                    pass
+
+            # Deduplicate and sort news
+            unique_news = { (item["title"], item["link"]): item for item in all_news }.values()
+            sorted_news = sorted(unique_news, key=lambda x: x["published"], reverse=True)
+            st.session_state.news_items = sorted_news[:100]  # Limit to 100 headlines
+
+        # Pagination settings
+        items_per_page = 10
+        total_items = len(st.session_state.news_items)
+        total_pages = min((total_items + items_per_page - 1) // items_per_page, 10)  # Up to 10 pages
+        current_page = st.session_state.current_page
+
+        # Ensure current_page is valid
+        if current_page < 1:
+            current_page = 1
+        elif current_page > total_pages:
+            current_page = total_pages
+        st.session_state.current_page = current_page
+
+        # Calculate slice for current page
+        start_idx = (current_page - 1) * items_per_page
+        end_idx = min(start_idx + items_per_page, total_items)
+        page_items = st.session_state.news_items[start_idx:end_idx]
+
+        # Display page indicator
+        st.write(f"Page {current_page} of {total_pages} ({total_items} headlines)")
+
+        # Display headlines for current page
+        if page_items:
+            for item in page_items:
+                title = item["title"]
+                link = item["link"]
+                published = item["published"].strftime("%Y-%m-%d %H:%M:%S")
+                source = item["source"]
+                flagged = contains_flagged_word(title, keywords) or contains_flagged_word(title, tickers)
+                prefix = ":red_circle: **" if flagged else ""
+                suffix = "**" if flagged else ""
+                st.markdown(f"- {prefix}[{title}]({link}){suffix}  \n*{published}*  \n`{source}`")
+        else:
+            st.info("No news headlines available.")
+
+        # Pagination controls
+        col_prev, col_next = st.columns([1, 1])
+        with col_prev:
+            if st.button("Previous", disabled=(current_page == 1), key="prev_page"):
+                st.session_state.current_page = current_page - 1
+                st.rerun()
+        with col_next:
+            if st.button("Next", disabled=(current_page == total_pages), key="next_page"):
+                st.session_state.current_page = current_page + 1
+                st.rerun()
+
+        # Optional: Page number buttons
+        st.write("Go to page:")
+        page_cols = st.columns(total_pages)
+        for i in range(total_pages):
+            with page_cols[i]:
+                if st.button(str(i + 1), key=f"page_{i+1}", disabled=(current_page == i + 1)):
+                    st.session_state.current_page = i + 1
+                    st.rerun()
 
     with col2:
         st.subheader("Live Chart Demo – Yahoo Finance")
@@ -277,7 +345,7 @@ with tab_dashboard:
 
         for interval, period in intervals:
             try:
-                df_chart = yf.download(selected, period=period, interval=interval, progress=False)
+                df_chart = yf.download(selected, period=period, interval=interval, progress=False, auto_adjust=False)
                 if not df_chart.empty:
                     label = f"{interval}, {period}"
                     break
@@ -401,11 +469,9 @@ with tab_video_summary:
             st.error(f"Error loading videos from Firestore: {e}")
             return [], None
 
-    # Load videos and timestamp from Firestore at startup
-    if not st.session_state.videos:
-        videos, last_fetch_time = load_videos_from_firestore()
-        st.session_state.videos = videos
-        st.session_state.last_fetch_time = last_fetch_time
+    # Load videos only if not cached
+    if 'videos' not in st.session_state or not st.session_state.videos:
+        st.session_state.videos, st.session_state.last_fetch_time = load_videos_from_firestore()
 
     # Section 1: Fetch videos from predefined channels (Uploads + Live)
     st.subheader("Recent Videos (Last 48 Hours)")
@@ -503,7 +569,7 @@ with tab_video_summary:
 
     # Display fetched videos with thumbnails and summarize buttons
     if st.session_state.videos:
-        for video in st.session_state.videos:
+        for video in st.session_state.videos[:5]:  # Limit to 5 videos to reduce checks
             vid = video['video_id']
             col1, col2 = st.columns([1, 3])
             with col1:
@@ -515,55 +581,27 @@ with tab_video_summary:
                 st.write(f"Source: {video['source']}")
                 st.markdown(f"[Watch on YouTube](https://www.youtube.com/watch?v={vid})")
 
-                # Check if the video has already been summarized
-                existing_summary = check_existing_summary(vid)
-                if existing_summary:
-                    st.info(f"This video has already been summarized by {existing_summary['summarized_by']} at {existing_summary['timestamp']}.")
-                    st.success("Existing Summary:")
-                    st.write(existing_summary['summary'])
-                else:
-                    if st.button("Summarize", key=f"summarize_{vid}"):
-                        with st.spinner(f"Summarizing {video['title']}..."):
-                            try:
-                                transcript_data = YouTubeTranscriptApi.get_transcript(
-                                    vid,
-                                    languages=['en', 'en-US']
-                                )
-                                text = " ".join(segment['text'] for segment in transcript_data if 'text' in segment)
-                            except TranscriptsDisabled:
-                                st.session_state.errors[vid] = "Transcripts are disabled for this video."
-                                continue
-                            except NoTranscriptFound:
-                                try:
-                                    transcript_list = YouTubeTranscriptApi.list_transcripts(vid)
-                                    transcript = next(transcript_list.__iter__(), None)
-                                    if not transcript:
-                                        raise NoTranscriptFound("No transcripts available for this video.")
-                                    transcript_data = transcript.fetch()
-                                    text = " ".join(segment['text'] for segment in transcript_data if 'text' in segment)
-                                except NoTranscriptFound:
-                                    st.session_state.errors[vid] = "No transcripts available for this video."
-                                    continue
-                            except Exception as e:
-                                st.session_state.errors[vid] = f"Could not get transcript: {e}"
-                                continue
-
-                            try:
-                                summary = summarize_transcript(text, OPENAI_API_KEY)
-                                st.session_state.summaries[vid] = summary
-                                # Log the summary to Firestore
-                                log_summary(vid, video['title'], video['channel_name'], video['published'], summary, st.session_state.user_name)
-                                if vid in st.session_state.errors:
-                                    del st.session_state.errors[vid]
-                            except Exception as e:
-                                st.session_state.errors[vid] = str(e)
-                                st.session_state.summaries[vid] = "Summarization failed."
-
-            if vid in st.session_state.errors:
-                st.error(st.session_state.errors[vid])
-            if summary := st.session_state.summaries.get(vid):
-                st.success("Summary:")
-                st.write(summary)
+                # Check summary only on button click
+                if st.button("Check Summary", key=f"check_{vid}"):
+                    existing_summary = check_existing_summary(vid)
+                    if existing_summary:
+                        st.info(f"Summarized by {existing_summary['summarized_by']} at {existing_summary['timestamp']}.")
+                        st.success("Existing Summary:")
+                        st.write(existing_summary['summary'])
+                    else:
+                        st.info("No existing summary found.")
+                if st.button("Summarize", key=f"summarize_{vid}"):
+                    with st.spinner(f"Summarizing {video['title']}..."):
+                        try:
+                            transcript_data = YouTubeTranscriptApi.get_transcript(vid, languages=['en', 'en-US'])
+                            text = " ".join(segment['text'] for segment in transcript_data if 'text' in segment)
+                            summary = summarize_transcript(text, OPENAI_API_KEY)
+                            st.session_state.summaries[vid] = summary
+                            log_summary(vid, video['title'], video['channel_name'], video['published'], summary, st.session_state.user_name)
+                            st.success("Summary:")
+                            st.write(summary)
+                        except Exception as e:
+                            st.error(f"Could not summarize video: {e}")
             st.markdown("---")
     else:
         st.info("Click 'Fetch Recent Videos' to load recent videos from selected channels.")
@@ -794,4 +832,3 @@ with tab_settings:
             st.rerun()
 
     st.markdown("---")
-    
