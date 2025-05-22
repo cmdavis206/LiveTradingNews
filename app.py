@@ -263,34 +263,41 @@ with tab_dashboard:
             st.session_state.news_items = []
         if 'current_page' not in st.session_state:
             st.session_state.current_page = 1
-        if 'last_news_fetch' not in st.session_state:
-            st.session_state.last_news_fetch = None
+        if 'last_news_reset' not in st.session_state:
+            st.session_state.last_news_reset = datetime.now(timezone.utc)
 
-        # Fetch only new articles
+        # Reset news_items every 10 minutes to ensure freshness
         now = datetime.now(timezone.utc)
-        last_fetch = st.session_state.last_news_fetch
+        if (now - st.session_state.last_news_reset).total_seconds() >= 600:  # 10 minutes
+            st.session_state.news_items = []
+            st.session_state.last_news_reset = now
+
+        # Fetch new articles
         new_articles = []
+        existing_items = {(item["title"], item["link"]) for item in st.session_state.news_items}
         for feed_url in rss_feeds:
             try:
-                feed = feedparser.parse(feed_url)
+                # Force fresh fetch with no caching
+                feed = feedparser.parse(feed_url, request_headers={'Cache-Control': 'no-cache'})
                 if feed.bozo:
                     st.warning(f"Invalid RSS feed: {feed_url}")
                     continue
-                for entry in feed.entries[:10]:  # Limit to 10 per feed
+                for entry in feed.entries:  # Process all entries
                     try:
                         pub_dt = (
                             datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
                             if hasattr(entry, "published_parsed") and entry.published_parsed
                             else now
                         )
-                        # Fetch only articles newer than last fetch
-                        if last_fetch is None or pub_dt > last_fetch:
+                        item_key = (entry.title, entry.link)
+                        if item_key not in existing_items:
                             new_articles.append({
                                 "title": entry.title,
                                 "link": entry.link,
                                 "published": pub_dt,
                                 "source": feed_url
                             })
+                            existing_items.add(item_key)
                     except Exception:
                         continue
             except Exception as e:
@@ -299,15 +306,12 @@ with tab_dashboard:
 
         # Update news_items if new articles found
         if new_articles:
-            # Append new articles
             st.session_state.news_items.extend(new_articles)
             # Deduplicate by title and link
             unique_news = { (item["title"], item["link"]): item for item in st.session_state.news_items }.values()
             # Sort by published date (newest first) and limit to 100
             st.session_state.news_items = sorted(unique_news, key=lambda x: x["published"], reverse=True)[:100]
-            st.write(f"Fetched {len(new_articles)} new headlines at {to_pdt(now).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
-        st.session_state.last_news_fetch = now
+            st.write(f"Updated headlines at {to_pdt(now).strftime('%Y-%m-%d %H:%M:%S %Z')} ({len(new_articles)} new)")
 
         # Pagination settings
         items_per_page = 10
