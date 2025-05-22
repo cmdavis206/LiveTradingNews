@@ -14,6 +14,7 @@ import feedparser
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
+import time
 
 # --- Streamlit page config ---
 st.set_page_config(page_title="Real Time Trader News", layout="wide")
@@ -154,51 +155,61 @@ def check_existing_summary(video_id):
             return doc.to_dict()
         return None
     except Exception as e:
-        st.error(f"Error checking existing summary: {e}")
+        st.error(f"Error checking summary for video {video_id}: {e}")
         return None
 
-# Function to log a new summary
+# Function to log a new summary with retry
 def log_summary(video_id, title, channel_name, published, summary, summarized_by):
     try:
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         doc_ref = db.collection('summaries').document(video_id)
-        doc_ref.set({
-            'video_id': video_id,
-            'title': title,
-            'channel_name': channel_name,
-            'published': published,
-            'summary': summary,
-            'timestamp': timestamp,
-            'summarized_by': summarized_by
-        })
+        for attempt in range(3):  # Retry up to 3 times
+            try:
+                doc_ref.set({
+                    'video_id': video_id,
+                    'title': title,
+                    'channel_name': channel_name,
+                    'published': published,
+                    'summary': summary,
+                    'timestamp': timestamp,
+                    'summarized_by': summarized_by
+                })
+                st.write(f"Summary saved for video {video_id}.")
+                return
+            except Exception as e:
+                st.warning(f"Retry {attempt + 1}/3: Error saving summary for video {video_id}: {e}")
+                time.sleep(1)
+        st.error(f"Failed to save summary for video {video_id} after 3 attempts.")
     except Exception as e:
-        st.error(f"Error logging summary to Firestore: {e}")
+        st.error(f"Error logging summary for video {video_id}: {e}")
 
-# Function to get all summaries for the log
-def get_summary_log():
-    try:
-        summaries_ref = db.collection('summaries').order_by('timestamp', direction=firestore.Query.DESCENDING)
-        docs = summaries_ref.stream()
-        summaries = []
-        for doc in docs:
-            summaries.append(doc.to_dict())
-        return pd.DataFrame(summaries)
-    except Exception as e:
-        st.error(f"Error retrieving summary log: {e}")
-        return pd.DataFrame()
+# Function to preload summaries for videos
+def preload_summaries(videos, max_videos=20):
+    summaries = st.session_state.get('summaries', {})
+    for video in videos[:max_videos]:  # Limit to max_videos to control reads
+        vid = video['video_id']
+        if vid not in summaries:
+            existing_summary = check_existing_summary(vid)
+            if existing_summary:
+                summaries[vid] = existing_summary['summary']
+    st.session_state.summaries = summaries
 
 # --- Main Tabs ---
-tab_dashboard, tab_video_summary, tab_settings = st.tabs(
-    ["Dashboard", "Video Summary", "Settings"]
-)
+# Initialize tab index in session state
+if 'tab_index' not in st.session_state:
+    st.session_state.tab_index = 0
 
-# --- Dashboard Tab: News Feed & Chart ---
+# Create tabs without key parameter
+tab_dashboard, tab_video_summary, tab_settings = st.tabs(["Dashboard", "Video Summary", "Settings"])
+
+# --- Dashboard Tab ---
 with tab_dashboard:
+    st.session_state.tab_index = 0
     st.title("Real Time Trader News Dashboard")
     st.caption("MVP – News Dashboard for Active Traders")
 
-    # --- Auto-Refresh ---
-    st_autorefresh(interval=60000, limit=None, key="news_autorefresh")  # Refresh every 60 seconds
+    # --- Auto-Refresh (scoped to Dashboard) ---
+    st_autorefresh(interval=30000, limit=None, key=f"news_autorefresh_{int(time.time())}")  # 30 seconds, unique key
 
     # --- Top Movers ---
     st.subheader("Top Movers Today (S&P 500)")
@@ -244,14 +255,24 @@ with tab_dashboard:
             st.session_state.news_items = []
         if 'current_page' not in st.session_state:
             st.session_state.current_page = 1
+        if 'last_news_fetch' not in st.session_state:
+            st.session_state.last_news_fetch = None
 
-        # Fetch news only if not already cached
+        # Force news fetch if 30 seconds have elapsed
+        now = datetime.now(timezone.utc)
+        if (st.session_state.last_news_fetch is None or 
+            (now - st.session_state.last_news_fetch).total_seconds() >= 30):
+            st.session_state.news_items = []
+            st.session_state.last_news_fetch = now
+
+        # Fetch news if cache is empty
         if not st.session_state.news_items:
             all_news = []
             for feed_url in rss_feeds:
                 try:
                     feed = feedparser.parse(feed_url)
                     if feed.bozo:
+                        st.warning(f"Invalid RSS feed: {feed_url}")
                         continue
                     for entry in feed.entries[:10]:  # Limit to 10 per feed
                         try:
@@ -268,13 +289,15 @@ with tab_dashboard:
                             "published": pub_dt,
                             "source": feed_url
                         })
-                except Exception:
-                    pass
+                except Exception as e:
+                    st.error(f"Error parsing RSS feed {feed_url}: {e}")
+                    continue
 
             # Deduplicate and sort news
             unique_news = { (item["title"], item["link"]): item for item in all_news }.values()
             sorted_news = sorted(unique_news, key=lambda x: x["published"], reverse=True)
             st.session_state.news_items = sorted_news[:100]  # Limit to 100 headlines
+            st.write(f"Fetched {len(st.session_state.news_items)} headlines at {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
         # Pagination settings
         items_per_page = 10
@@ -391,12 +414,12 @@ with tab_dashboard:
 
 # --- Video Summary Tab ---
 with tab_video_summary:
+    st.session_state.tab_index = 1
     st.header("YouTube Video Summarizer")
 
-    # Predefined list of YouTube channel IDs (you can add more)
+    # Predefined list of YouTube channel IDs
     CHANNEL_IDS = [
         "UCymzDnu-l3vZ1fxuqvRePOA",  # The Trading Fraternity
-        "UCAuUUnT6oDeKwE6v1NGQxug",  # TED (for testing)
         "UCNjyEXSvYUUCzagFAKmaJ1Q",  # The Rebel Capitalist
         "UCigUBIf-zt_DA6xyOQtq2WA",  # ClearValue Tax
         "UCrXNkk4IESnqU-8GMad2vyA",  # Eurodollar University
@@ -473,6 +496,10 @@ with tab_video_summary:
     if 'videos' not in st.session_state or not st.session_state.videos:
         st.session_state.videos, st.session_state.last_fetch_time = load_videos_from_firestore()
 
+    # Preload summaries for videos
+    if st.session_state.videos and not st.session_state.summaries:
+        preload_summaries(st.session_state.videos, max_videos=20)
+
     # Section 1: Fetch videos from predefined channels (Uploads + Live)
     st.subheader("Recent Videos (Last 48 Hours)")
     
@@ -487,6 +514,7 @@ with tab_video_summary:
         else:
             with st.spinner("Fetching recent videos..."):
                 st.session_state.videos = []
+                st.session_state.summaries = {}  # Clear summaries to sync with new videos
                 st.session_state.last_fetch_time = datetime.now(timezone.utc)  # Store fetch timestamp
                 youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
                 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=48)
@@ -566,43 +594,60 @@ with tab_video_summary:
 
                 # Save videos and timestamp to Firestore
                 save_videos_to_firestore(st.session_state.videos, st.session_state.last_fetch_time)
+                # Preload summaries for new videos
+                preload_summaries(st.session_state.videos, max_videos=20)
 
     # Display fetched videos with thumbnails and summarize buttons
     if st.session_state.videos:
-        for video in st.session_state.videos[:5]:  # Limit to 5 videos to reduce checks
+        for video in st.session_state.videos:  # Show all videos
             vid = video['video_id']
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                st.image(video['thumbnail'], use_container_width=True)
-            with col2:
-                st.subheader(video['title'])
-                st.write(f"Channel: {video['channel_name']}")
-                st.write(f"Published: {video['published']}")
-                st.write(f"Source: {video['source']}")
-                st.markdown(f"[Watch on YouTube](https://www.youtube.com/watch?v={vid})")
+            with st.container():
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    st.image(video['thumbnail'], use_container_width=True)
+                with col2:
+                    st.subheader(video['title'])
+                    st.write(f"Channel: {video['channel_name']}")
+                    st.write(f"Published: {video['published']}")
+                    st.write(f"Source: {video['source']}")
+                    st.markdown(f"[Watch on YouTube](https://www.youtube.com/watch?v={vid})")
 
-                # Check summary only on button click
-                if st.button("Check Summary", key=f"check_{vid}"):
-                    existing_summary = check_existing_summary(vid)
-                    if existing_summary:
-                        st.info(f"Summarized by {existing_summary['summarized_by']} at {existing_summary['timestamp']}.")
-                        st.success("Existing Summary:")
-                        st.write(existing_summary['summary'])
-                    else:
-                        st.info("No existing summary found.")
-                if st.button("Summarize", key=f"summarize_{vid}"):
-                    with st.spinner(f"Summarizing {video['title']}..."):
-                        try:
-                            transcript_data = YouTubeTranscriptApi.get_transcript(vid, languages=['en', 'en-US'])
-                            text = " ".join(segment['text'] for segment in transcript_data if 'text' in segment)
-                            summary = summarize_transcript(text, OPENAI_API_KEY)
-                            st.session_state.summaries[vid] = summary
-                            log_summary(vid, video['title'], video['channel_name'], video['published'], summary, st.session_state.user_name)
-                            st.success("Summary:")
-                            st.write(summary)
-                        except Exception as e:
-                            st.error(f"Could not summarize video: {e}")
-            st.markdown("---")
+                    # Use form to isolate button actions
+                    with st.form(key=f"video_form_{vid}"):
+                        col_check, col_summarize = st.columns(2)
+                        with col_check:
+                            check_submitted = st.form_submit_button("Check Summary")
+                        with col_summarize:
+                            summarize_submitted = st.form_submit_button("Summarize")
+
+                        if check_submitted:
+                            st.write(f"Checking summary for video ID: {vid}")
+                            existing_summary = check_existing_summary(vid)
+                            if existing_summary:
+                                st.session_state.summaries[vid] = existing_summary['summary']  # Update cache
+                                st.info(f"Summarized by {existing_summary['summarized_by']} at {existing_summary['timestamp']}.")
+                            else:
+                                st.info("No existing summary found.")
+
+                        if summarize_submitted:
+                            with st.spinner(f"Summarizing {video['title']}..."):
+                                try:
+                                    transcript_data = YouTubeTranscriptApi.get_transcript(vid, languages=['en', 'en-US'])
+                                    text = " ".join(segment['text'] for segment in transcript_data if 'text' in segment)
+                                    summary = summarize_transcript(text, OPENAI_API_KEY)
+                                    st.session_state.summaries[vid] = summary  # Cache locally
+                                    log_summary(vid, video['title'], video['channel_name'], video['published'], summary, st.session_state.user_name)
+                                except Exception as e:
+                                    st.error(f"Could not summarize video: {e}")
+
+                    # Display summary if available
+                    if vid in st.session_state.summaries:
+                        st.success("Summary:")
+                        st.write(st.session_state.summaries[vid])
+
+                if vid in st.session_state.errors:
+                    st.error(st.session_state.errors[vid])
+                st.markdown("---")
     else:
         st.info("Click 'Fetch Recent Videos' to load recent videos from selected channels.")
 
@@ -683,16 +728,9 @@ with tab_video_summary:
         st.success("Custom Video Summary:")
         st.write(st.session_state.custom_url_summary)
 
-    # Section 3: Summary Log
-    st.subheader("Summary Log")
-    summary_log = get_summary_log()
-    if not summary_log.empty:
-        st.dataframe(summary_log)
-    else:
-        st.info("No summaries have been logged yet.")
-
 # --- Settings Tab ---
 with tab_settings:
+    st.session_state.tab_index = 2
     st.header("Manage Your Settings")
 
     # --- Keywords ---
